@@ -4,8 +4,9 @@ import asyncio
 import io
 import os
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 
 class ProviderIntegrationPending(RuntimeError):
@@ -87,14 +88,32 @@ class ProxyVIPClient:
         return None
 
     @staticmethod
+    def _message_signature(message: Any) -> tuple[str, tuple[tuple[str, ...], ...]]:
+        text = str(getattr(message, "message", "") or "")
+        markup = getattr(message, "reply_markup", None)
+        rows = getattr(markup, "rows", []) or []
+        button_rows = tuple(
+            tuple(str(getattr(button, "text", "") or "") for button in (getattr(row, "buttons", []) or []))
+            for row in rows
+        )
+        return text, button_rows
+
+    @staticmethod
     def _is_quantity_prompt(message: Any) -> bool:
         text = str(getattr(message, "message", "") or "").casefold()
         return ("quantidade" in text and "key" in text) or ("quantity" in text and "key" in text)
 
-    async def _choose_duration_or_default(self, chat: Any, bot_id: int, message: Any, duration_days: int) -> Any:
+    async def _choose_duration_or_default(
+        self,
+        chat: Any,
+        bot_id: int,
+        message: Any,
+        duration_days: int,
+        incoming: asyncio.Queue[tuple[str, Any]] | None = None,
+    ) -> Any:
         label = self.duration_label(duration_days)
         if self._find_button(message, label):
-            return await self._choose_and_wait(chat, bot_id, message, label)
+            return await self._choose_and_wait(chat, bot_id, message, label, incoming)
         if self._is_quantity_prompt(message):
             if duration_days != 1:
                 raise ValueError(
@@ -102,7 +121,7 @@ class ProxyVIPClient:
                     "Nenhuma key foi solicitada; escolha 1 dia ou aguarde um seletor de duração."
                 )
             return message
-        return await self._choose_and_wait(chat, bot_id, message, label)
+        return await self._choose_and_wait(chat, bot_id, message, label, incoming)
 
     @classmethod
     def extract_keys(cls, text: str | None) -> list[str]:
@@ -216,74 +235,147 @@ class ProxyVIPClient:
             bot_id = int(chat.id)
             start_message = await self._send_and_wait(chat, bot_id, "/start")
             generation_menu = await self._choose_and_wait(chat, bot_id, start_message, "Gerar Key Proxy")
-            duration_menu = await self._choose_duration_or_default(chat, bot_id, generation_menu, duration_days)
-            before_quantity_id = int(duration_menu.id)
-            await self._client.send_message(chat, str(quantity))
-            return await self._wait_for_keys(chat, bot_id, before_quantity_id, quantity)
+            async with self._bot_message_feed(chat, bot_id) as incoming:
+                duration_menu = await self._choose_duration_or_default(
+                    chat, bot_id, generation_menu, duration_days, incoming
+                )
+                duration_menu_id = int(duration_menu.id)
+                original_signature = self._message_signature(duration_menu)
+                await self._client.send_message(chat, str(quantity))
+                return await self._wait_for_keys(
+                    incoming,
+                    quantity=quantity,
+                    after_id=duration_menu_id,
+                    original_signature=original_signature,
+                )
 
-    async def _latest_message_id(self, chat: Any) -> int:
-        messages = await self._client.get_messages(chat, limit=1)
-        return int(messages[0].id) if messages else 0
+    @asynccontextmanager
+    async def _bot_message_feed(self, chat: Any, bot_id: int) -> AsyncIterator[asyncio.Queue[tuple[str, Any]]]:
+        """Temporarily receive provider updates without polling GetHistoryRequest."""
+        from telethon import events
 
-    async def _wait_for_bot_message(self, chat: Any, bot_id: int, after_id: int, timeout: float = 35.0) -> Any:
+        incoming: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+        async def on_new_message(event: Any) -> None:
+            if int(getattr(event, "sender_id", 0) or 0) == bot_id:
+                incoming.put_nowait(("new", event.message))
+
+        async def on_edited_message(event: Any) -> None:
+            if int(getattr(event, "sender_id", 0) or 0) == bot_id:
+                incoming.put_nowait(("edited", event.message))
+
+        handlers = (
+            (on_new_message, events.NewMessage(chats=chat)),
+            (on_edited_message, events.MessageEdited(chats=chat)),
+        )
+        registered: list[tuple[Any, Any]] = []
+        try:
+            for callback, builder in handlers:
+                self._client.add_event_handler(callback, builder)
+                registered.append((callback, builder))
+            yield incoming
+        finally:
+            for callback, builder in registered:
+                self._client.remove_event_handler(callback, builder)
+
+    async def _wait_for_bot_message(
+        self,
+        incoming: asyncio.Queue[tuple[str, Any]],
+        *,
+        timeout: float = 35.0,
+        edited_message_id: int | None = None,
+        original_signature: tuple[str, tuple[tuple[str, ...], ...]] | None = None,
+        allow_any_edit: bool = False,
+    ) -> Any:
         deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            messages = await self._client.get_messages(chat, limit=50)
-            candidates = [
-                message for message in messages
-                if int(message.id) > after_id and int(getattr(message, "sender_id", 0) or 0) == bot_id
-            ]
-            if candidates:
-                return min(candidates, key=lambda message: int(message.id))
-            await asyncio.sleep(0.5)
-        raise ProviderResponseError("O bot fornecedor não respondeu dentro do tempo esperado.")
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise ProviderResponseError("O bot fornecedor não respondeu dentro do tempo esperado.")
+            try:
+                event_type, message = await asyncio.wait_for(incoming.get(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise ProviderResponseError("O bot fornecedor não respondeu dentro do tempo esperado.") from exc
+
+            if event_type == "new":
+                return message
+            if event_type == "edited":
+                if allow_any_edit:
+                    return message
+                if edited_message_id is not None and int(message.id) == edited_message_id:
+                    if self._message_signature(message) != original_signature:
+                        return message
 
     async def _send_and_wait(self, chat: Any, bot_id: int, text: str) -> Any:
-        after_id = await self._latest_message_id(chat)
-        await self._client.send_message(chat, text)
-        return await self._wait_for_bot_message(chat, bot_id, after_id)
+        async with self._bot_message_feed(chat, bot_id) as incoming:
+            await self._client.send_message(chat, text)
+            return await self._wait_for_bot_message(incoming, allow_any_edit=True)
 
-    async def _choose_and_wait(self, chat: Any, bot_id: int, message: Any, label: str) -> Any:
+    async def _perform_button_action(self, chat: Any, message: Any, label: str, incoming: asyncio.Queue[tuple[str, Any]]) -> Any:
         from telethon.tl.types import ReplyInlineMarkup
 
-        after_id = int(message.id)
-        markup = getattr(message, "reply_markup", None)
+        original_signature = self._message_signature(message)
         button = self._find_button(message, label)
-        if isinstance(markup, ReplyInlineMarkup):
+        if isinstance(getattr(message, "reply_markup", None), ReplyInlineMarkup):
             if button is None:
                 raise ProviderResponseError(f"Não encontrei o botão esperado no fornecedor: {label}.")
             await message.click(button[0], button[1])
-        elif button is not None:
-            await self._client.send_message(chat, button[2])
         else:
-            await self._client.send_message(chat, label)
-        return await self._wait_for_bot_message(chat, bot_id, after_id)
+            await self._client.send_message(chat, button[2] if button is not None else label)
+        return await self._wait_for_bot_message(
+            incoming,
+            edited_message_id=int(message.id),
+            original_signature=original_signature,
+        )
 
-    async def _wait_for_keys(
+    async def _choose_and_wait(
         self,
         chat: Any,
         bot_id: int,
+        message: Any,
+        label: str,
+        incoming: asyncio.Queue[tuple[str, Any]] | None = None,
+    ) -> Any:
+        if incoming is not None:
+            return await self._perform_button_action(chat, message, label, incoming)
+        async with self._bot_message_feed(chat, bot_id) as feed:
+            return await self._perform_button_action(chat, message, label, feed)
+
+    async def _wait_for_keys(
+        self,
+        incoming: asyncio.Queue[tuple[str, Any]],
+        *,
         after_id: int,
         quantity: int,
         timeout: float = 60.0,
+        original_signature: tuple[str, tuple[tuple[str, ...], ...]] | None = None,
     ) -> list[str]:
         deadline = asyncio.get_running_loop().time() + timeout
-        seen_ids: set[int] = set()
         keys: list[str] = []
-        while asyncio.get_running_loop().time() < deadline:
-            messages = await self._client.get_messages(chat, limit=100)
-            for message in sorted(messages, key=lambda item: int(item.id)):
-                message_id = int(message.id)
-                if message_id <= after_id or message_id in seen_ids:
+        seen_events: set[tuple[int, tuple[str, tuple[tuple[str, ...], ...]]]] = set()
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise ProviderResponseError("A resposta não continha a quantidade esperada de keys EXTERNAL-.")
+            try:
+                event_type, message = await asyncio.wait_for(incoming.get(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise ProviderResponseError("A resposta não continha a quantidade esperada de keys EXTERNAL-.") from exc
+
+            message_id = int(message.id)
+            signature = self._message_signature(message)
+            if event_type == "new" and message_id <= after_id:
+                continue
+            if event_type == "edited":
+                if message_id < after_id:
                     continue
-                if int(getattr(message, "sender_id", 0) or 0) != bot_id:
+                if message_id == after_id and signature == original_signature:
                     continue
-                seen_ids.add(message_id)
-                keys.extend(self.extract_keys(getattr(message, "message", "")))
-                if len(keys) >= quantity:
-                    # Deduplicate while preserving order, then return no more than requested.
-                    unique = list(dict.fromkeys(keys))
-                    if len(unique) >= quantity:
-                        return unique[:quantity]
-            await asyncio.sleep(0.5)
-        raise ProviderResponseError("A resposta não continha a quantidade esperada de keys EXTERNAL-.")
+            event_key = (message_id, signature)
+            if event_key in seen_events:
+                continue
+            seen_events.add(event_key)
+            keys.extend(self.extract_keys(getattr(message, "message", "")))
+            unique = list(dict.fromkeys(keys))
+            if len(unique) >= quantity:
+                return unique[:quantity]
