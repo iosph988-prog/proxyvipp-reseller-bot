@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import sqlite3
 import time
 from pathlib import Path
@@ -22,6 +23,11 @@ def _connect() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS alerts ("
         "user_id INTEGER PRIMARY KEY, last_alert INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS generated_keys ("
+        "fingerprint TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, "
+        "created_at INTEGER NOT NULL, deleted_at INTEGER)"
     )
     conn.commit()
     return conn
@@ -88,3 +94,65 @@ def should_alert(user_id: int, cooldown_seconds: int = 3600, now: int | None = N
         )
         conn.commit()
     return True
+
+
+def _key_fingerprint(key: str) -> str:
+    return hashlib.sha256(key.strip().upper().encode("utf-8")).hexdigest()
+
+
+def record_generated_keys(owner_id: int, keys: list[str], now: int | None = None) -> None:
+    """Record only a one-way fingerprint, never the plaintext key."""
+    now = int(time.time()) if now is None else int(now)
+    rows = [(_key_fingerprint(key), int(owner_id), now) for key in keys if key.strip()]
+    if not rows:
+        return
+    with _connect() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO generated_keys(fingerprint, owner_id, created_at) VALUES(?,?,?)",
+            rows,
+        )
+        conn.commit()
+
+
+def generated_key_record(key: str) -> tuple[int, int | None] | None:
+    """Return (owner ID, deletion timestamp), or None for an untracked key."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT owner_id, deleted_at FROM generated_keys WHERE fingerprint = ?",
+            (_key_fingerprint(key),),
+        ).fetchone()
+    return (int(row[0]), int(row[1]) if row[1] is not None else None) if row else None
+
+
+def key_deletion_denial(user_id: int, admin_id: int, key: str) -> str | None:
+    """Return a denial reason unless the requester may delete this key."""
+    record = generated_key_record(key)
+    if record and record[1] is not None:
+        return "already_deleted"
+    if int(user_id) == int(admin_id):
+        return None
+    if record is None:
+        return "untracked"
+    if record[0] != int(user_id):
+        return "not_owner"
+    return None
+
+
+def mark_generated_key_deleted(
+    key: str,
+    now: int | None = None,
+    owner_id: int | None = None,
+) -> None:
+    now = int(time.time()) if now is None else int(now)
+    with _connect() as conn:
+        if owner_id is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO generated_keys(fingerprint, owner_id, created_at, deleted_at) "
+                "VALUES(?,?,?,?)",
+                (_key_fingerprint(key), int(owner_id), now, now),
+            )
+        conn.execute(
+            "UPDATE generated_keys SET deleted_at = ? WHERE fingerprint = ? AND deleted_at IS NULL",
+            (now, _key_fingerprint(key)),
+        )
+        conn.commit()

@@ -4,7 +4,7 @@ Projeto separado do bot `.3105`. O bot aplica controle de acesso temporário por
 
 ## Como funciona
 
-A Bot API do Telegram não permite que um bot converse diretamente com outro bot. Por isso, este projeto usa Telethon como cliente da conta Telegram autorizada pelo administrador. A conta envia somente o fluxo de geração mostrado no vídeo: `/start` → **Gerar Key Proxy** → duração → quantidade. O bot não automatiza as funções de banir, apagar ou resetar keys.
+A Bot API do Telegram não permite que um bot converse diretamente com outro bot. Por isso, este projeto usa Telethon como cliente da conta Telegram autorizada pelo administrador. A conta automatiza o fluxo de geração e, após confirmação explícita, o fluxo do provedor para excluir uma key.
 
 O vídeo mostra as durações de 1, 3, 7, 15 e 30 dias e um limite máximo de 100 keys por pedido. A automação aceita esses prazos; horas e duração personalizada ainda não estão implementadas.
 
@@ -18,7 +18,7 @@ Revendedores sem acesso usam `/pedir_acesso`. O administrador configurado por `A
 - `/status_proxy` — verifica a configuração e a autorização da conta Telegram.
 - `/conectar_proxy` — envia ao administrador um QR para autorizar a sessão da conta.
 
-Para solicitar keys, um usuário aprovado pode usar `/gerar DIAS QUANTIDADE` ou seguir o menu de botões de `/start` e `/ajuda`: escolhe a duração, a quantidade e recebe um cartão com as keys e opção de cópia. O painel administrativo inclui atalhos para cadastrar e listar revendedores.
+Para solicitar keys, um usuário aprovado pode usar `/gerar DIAS QUANTIDADE` ou seguir o menu de botões de `/start` e `/ajuda`: escolhe a duração, a quantidade e recebe um cartão com as keys e opção de cópia. Para excluir, escolha **Excluir minha key** ou use `/deletar_key`, envie a key exata e confirme no botão. Revendedores só podem excluir keys emitidas pelo próprio ID através deste bot; o administrador pode excluir qualquer key. O bot guarda apenas o hash da key e o vínculo com o ID, não o código em texto claro.
 
 ## Acesso da conta Telegram
 

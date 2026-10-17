@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from html import escape
 from io import BytesIO
@@ -25,7 +26,16 @@ from telegram.ext import (
     filters,
 )
 
-from access_control import approve, is_allowed, list_active, revoke, should_alert
+from access_control import (
+    approve,
+    is_allowed,
+    key_deletion_denial,
+    list_active,
+    mark_generated_key_deleted,
+    record_generated_keys,
+    revoke,
+    should_alert,
+)
 from provider import (
     ProviderAuthorizationError,
     ProviderIntegrationPending,
@@ -63,6 +73,7 @@ def _access_request_keyboard() -> InlineKeyboardMarkup:
 def _home_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🔑 Gerar keys", callback_data="generate_menu")],
+        [InlineKeyboardButton("🗑 Excluir minha key", callback_data="delete_key")],
         [InlineKeyboardButton("📘 Como usar", callback_data="help_generate")],
     ]
     if is_admin:
@@ -121,6 +132,21 @@ def _custom_quantity_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _cancel_delete_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✖️ Cancelar", callback_data="delete_cancel")]]
+    )
+
+
+def _confirm_delete_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("🗑 Confirmar exclusão", callback_data="delete_confirm"),
+            InlineKeyboardButton("✖️ Cancelar", callback_data="delete_cancel"),
+        ]]
+    )
+
+
 def _result_keyboard(keys: list[str]) -> InlineKeyboardMarkup:
     rows = []
     copy_text = keys[0] if len(keys) == 1 else "\n".join(keys)
@@ -156,7 +182,8 @@ def _welcome_content(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             "✅ Seu acesso está ativo.\n\n"
             "Toque em <b>Gerar keys</b> para seguir as etapas ou use:\n"
             "<code>/gerar DIAS QUANTIDADE</code>\n\n"
-            "Prazos disponíveis: 1, 3, 7, 15 ou 30 dias."
+            "Prazos disponíveis: 1, 3, 7, 15 ou 30 dias.\n"
+            "Você também pode excluir uma key emitida por você neste bot."
         )
     return text, _home_keyboard(is_admin)
 
@@ -195,6 +222,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not user or not message:
         return
+    context.user_data.pop("pending_generation_days", None)
+    context.user_data.pop("awaiting_delete_key", None)
+    context.user_data.pop("pending_delete_key", None)
+    context.user_data.pop("pending_delete_expiry", None)
     if not _is_allowed(user.id):
         await _access_denied(update, context)
         return
@@ -314,7 +345,7 @@ async def _show_duration_menu(query) -> None:
     )
 
 
-async def _generate_and_reply(message, duration_days: int, quantity: int) -> None:
+async def _generate_and_reply(message, duration_days: int, quantity: int, user_id: int) -> None:
     try:
         keys = await provider.generate_keys(duration_days=duration_days, quantity=quantity)
     except (ProviderIntegrationPending, ProviderNotAuthorized) as exc:
@@ -330,6 +361,8 @@ async def _generate_and_reply(message, duration_days: int, quantity: int) -> Non
     if not keys:
         await message.reply_text("⚠️ O bot fornecedor não retornou keys.")
         return
+
+    record_generated_keys(user_id, keys)
 
     count = len(keys)
     key_word = "key" if count == 1 else "keys"
@@ -352,7 +385,40 @@ async def _generate_and_reply(message, duration_days: int, quantity: int) -> Non
 async def quantity_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     message = update.effective_message
-    if not user or not message or "pending_generation_days" not in context.user_data:
+    if not user or not message:
+        return
+    if context.user_data.get("awaiting_delete_key"):
+        if not _is_allowed(user.id):
+            context.user_data.pop("awaiting_delete_key", None)
+            await _access_denied(update, context)
+            return
+        context.user_data.pop("awaiting_delete_key", None)
+        try:
+            key = provider.normalize_key(message.text or "")
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return
+        denial = key_deletion_denial(user.id, ADMIN_ID, key)
+        if denial == "already_deleted":
+            await message.reply_text("⚠️ Esta key já consta como excluída neste bot.")
+            return
+        if denial:
+            await message.reply_text(
+                "🔒 Só é possível excluir keys geradas pelo seu próprio ID neste bot."
+            )
+            return
+        context.user_data["pending_delete_key"] = key
+        context.user_data["pending_delete_expiry"] = int(time.time()) + 300
+        await message.reply_text(
+            "<b>⚠️ Confirmar exclusão</b>\n\n"
+            "A exclusão é permanente no provedor e pode interromper o acesso associado.\n"
+            f"Key: <code>{escape(key)}</code>\n\n"
+            "Confirme somente se esta é a key correta.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_confirm_delete_keyboard(),
+        )
+        return
+    if "pending_generation_days" not in context.user_data:
         return
     if not _is_allowed(user.id):
         context.user_data.pop("pending_generation_days", None)
@@ -368,7 +434,65 @@ async def quantity_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
     duration_days = context.user_data.pop("pending_generation_days")
     await message.reply_text("⏳ Pedido recebido. Preparando suas keys...")
-    await _generate_and_reply(message, duration_days, quantity)
+    await _generate_and_reply(message, duration_days, quantity, user.id)
+
+
+async def delete_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    if not _is_allowed(user.id):
+        await _access_denied(update, context)
+        return
+    context.user_data.pop("pending_generation_days", None)
+    context.user_data.pop("pending_delete_key", None)
+    context.user_data.pop("pending_delete_expiry", None)
+    context.user_data["awaiting_delete_key"] = True
+    await message.reply_text(
+        "<b>🗑 EXCLUIR KEY</b>\n\n"
+        "Envie o código exato da key. Revendedores só podem excluir keys geradas pelo próprio ID neste bot.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_cancel_delete_keyboard(),
+    )
+
+
+async def _confirm_delete_key(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    key = context.user_data.pop("pending_delete_key", None)
+    expiry = context.user_data.pop("pending_delete_expiry", 0)
+    if not key or int(expiry) < int(time.time()):
+        await query.edit_message_text("A confirmação expirou. Inicie novamente pelo menu.")
+        return
+    denial = key_deletion_denial(user_id, ADMIN_ID, key)
+    if denial == "already_deleted":
+        await query.edit_message_text("⚠️ Esta key já consta como excluída neste bot.")
+        return
+    if denial:
+        await query.edit_message_text("🔒 Você não tem permissão para excluir essa key.")
+        return
+
+    await query.edit_message_text("⏳ Confirmado. Solicitando a exclusão ao provedor...")
+    try:
+        await provider.delete_key(key=key)
+    except (ProviderIntegrationPending, ProviderNotAuthorized, ProviderAuthorizationError, ValueError) as exc:
+        await query.edit_message_text(f"⚠️ {escape(str(exc))}", parse_mode=ParseMode.HTML)
+        return
+    except Exception:
+        logger.error("Falha ao solicitar exclusão ao bot fornecedor; detalhes ocultados para proteger a key")
+        await query.edit_message_text(
+            "❌ O provedor não confirmou a exclusão. A key não foi marcada como excluída; confira o status antes de tentar novamente."
+        )
+        return
+
+    mark_generated_key_deleted(key, owner_id=user_id)
+    await query.edit_message_text(
+        "<b>✅ Key excluída no provedor</b>\n\n"
+        f"<code>{escape(key)}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 Menu", callback_data="home")]]
+        ),
+    )
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -395,13 +519,42 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await _access_denied(update, context)
     elif data == "home":
         context.user_data.pop("pending_generation_days", None)
+        context.user_data.pop("awaiting_delete_key", None)
+        context.user_data.pop("pending_delete_key", None)
+        context.user_data.pop("pending_delete_expiry", None)
         if not _is_allowed(user.id):
             await _access_denied(update, context)
             return
         text, keyboard = _welcome_content(user.id)
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    elif data == "delete_key":
+        context.user_data.pop("pending_generation_days", None)
+        context.user_data.pop("pending_delete_key", None)
+        context.user_data.pop("pending_delete_expiry", None)
+        context.user_data["awaiting_delete_key"] = True
+        await query.edit_message_text(
+            "<b>🗑 EXCLUIR KEY</b>\n\n"
+            "Envie o código exato da key. Revendedores só podem excluir keys geradas pelo próprio ID neste bot.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_cancel_delete_keyboard(),
+        )
+    elif data == "delete_cancel":
+        context.user_data.pop("awaiting_delete_key", None)
+        context.user_data.pop("pending_delete_key", None)
+        context.user_data.pop("pending_delete_expiry", None)
+        await query.edit_message_text(
+            "Exclusão cancelada.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏠 Menu", callback_data="home")]]
+            ),
+        )
+    elif data == "delete_confirm":
+        await _confirm_delete_key(query, context, user.id)
     elif data == "generate_menu" or data == "quantity_cancel":
         context.user_data.pop("pending_generation_days", None)
+        context.user_data.pop("awaiting_delete_key", None)
+        context.user_data.pop("pending_delete_key", None)
+        context.user_data.pop("pending_delete_expiry", None)
         await _show_duration_menu(query)
     elif data == "help_generate":
         await query.edit_message_text(
@@ -409,11 +562,16 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "Escolha <b>Gerar keys</b> no menu e siga as etapas.\n"
             "Ou envie <code>/gerar DIAS QUANTIDADE</code>.\n\n"
             "Prazos: 1, 3, 7, 15 ou 30 dias.\n"
-            "Quantidade: de 1 a 100 por pedido.",
+            "Quantidade: de 1 a 100 por pedido.\n\n"
+            "Para excluir uma key própria, toque em <b>Excluir minha key</b> ou use /deletar_key; "
+            "o bot pedirá confirmação antes de apagar.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔑 Gerar keys", callback_data="generate_menu")],
-                 [InlineKeyboardButton("🏠 Menu", callback_data="home")]]
+                [
+                    [InlineKeyboardButton("🔑 Gerar keys", callback_data="generate_menu")],
+                    [InlineKeyboardButton("🗑 Excluir minha key", callback_data="delete_key")],
+                    [InlineKeyboardButton("🏠 Menu", callback_data="home")],
+                ]
             ),
         )
     elif data.startswith("gen_duration_"):
@@ -450,7 +608,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "<b>⏳ PEDIDO EM ANDAMENTO</b>\n\nConsultando o provedor...",
             parse_mode=ParseMode.HTML,
         )
-        await _generate_and_reply(message, duration_days, quantity)
+        await _generate_and_reply(message, duration_days, quantity, user.id)
     elif data == "add_reseller_help":
         await message.reply_text(
             "<b>➕ ADICIONAR REVENDEDOR</b>\n\n"
@@ -566,6 +724,9 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not _is_allowed(user.id):
         await _access_denied(update, context)
         return
+    context.user_data.pop("awaiting_delete_key", None)
+    context.user_data.pop("pending_delete_key", None)
+    context.user_data.pop("pending_delete_expiry", None)
     context.user_data.pop("pending_generation_days", None)
     if len(context.args) != 2 or not all(arg.isdigit() for arg in context.args):
         await message.reply_text(
@@ -583,7 +744,7 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text(f"A quantidade deve ficar entre 1 e {MAX_KEY_BATCH}.")
         return
     await message.reply_text("⏳ Pedido recebido. Preparando suas keys...")
-    await _generate_and_reply(message, duration_days, quantity)
+    await _generate_and_reply(message, duration_days, quantity, user.id)
 
 
 async def _post_init(application: Application) -> None:
@@ -592,6 +753,7 @@ async def _post_init(application: Application) -> None:
             BotCommand("start", "Abrir o painel"),
             BotCommand("ajuda", "Ver instruções"),
             BotCommand("gerar", "Gerar keys"),
+            BotCommand("deletar_key", "Excluir uma key própria"),
             BotCommand("pedir_acesso", "Solicitar acesso"),
         ]
         admin_commands = public_commands + [
@@ -640,11 +802,13 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("conectar_proxy", connect_proxy_command))
     app.add_handler(CommandHandler("status_proxy", proxy_status_command))
     app.add_handler(CommandHandler("gerar", generate_command))
+    app.add_handler(CommandHandler(["deletar_key", "excluir_key"], delete_key_command))
     app.add_handler(
         CallbackQueryHandler(
             menu_callback,
             pattern=(
                 r"^(request_access|help_generate|add_reseller_help|list_resellers|proxy_status|"
+                r"delete_key|delete_confirm|delete_cancel|"
                 r"generate_menu|home|gen_duration_(1|3|7|15|30)|"
                 r"quantity_(1|2|5|10|custom|cancel))$"
             ),

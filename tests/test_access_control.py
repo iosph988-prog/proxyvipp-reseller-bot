@@ -4,7 +4,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from access_control import approve, is_allowed, list_active, revoke, should_alert
+from access_control import (
+    approve,
+    generated_key_record,
+    is_allowed,
+    key_deletion_denial,
+    list_active,
+    mark_generated_key_deleted,
+    record_generated_keys,
+    revoke,
+    should_alert,
+)
 
 
 class AccessControlTests(unittest.TestCase):
@@ -51,6 +61,19 @@ class AccessControlTests(unittest.TestCase):
         self.assertTrue(should_alert(self.RESELLER, cooldown_seconds=100, now=1000))
         self.assertFalse(should_alert(self.RESELLER, cooldown_seconds=100, now=1099))
         self.assertTrue(should_alert(self.RESELLER, cooldown_seconds=100, now=1100))
+
+    def test_generated_key_ownership_and_deletion_marker(self):
+        key = "EXTERNAL-AB12-CD34-EF56"
+        self.assertIsNone(generated_key_record(key))
+        self.assertEqual(key_deletion_denial(self.RESELLER, self.ADMIN, key), "untracked")
+        self.assertIsNone(key_deletion_denial(self.ADMIN, self.ADMIN, key))
+        record_generated_keys(self.RESELLER, [key], now=1000)
+        self.assertEqual(generated_key_record(key), (self.RESELLER, None))
+        self.assertIsNone(key_deletion_denial(self.RESELLER, self.ADMIN, key))
+        self.assertEqual(key_deletion_denial(self.ADMIN + 1, self.ADMIN, key), "not_owner")
+        mark_generated_key_deleted(key, now=2000)
+        self.assertEqual(generated_key_record(key), (self.RESELLER, 2000))
+        self.assertEqual(key_deletion_denial(self.RESELLER, self.ADMIN, key), "already_deleted")
 
 
 if __name__ == "__main__":

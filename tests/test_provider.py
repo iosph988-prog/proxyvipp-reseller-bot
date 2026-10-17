@@ -3,7 +3,7 @@ import inspect
 import unittest
 from types import SimpleNamespace
 
-from provider import ProviderIntegrationPending, ProxyVIPClient
+from provider import ProviderIntegrationPending, ProviderResponseError, ProxyVIPClient
 
 
 class _FakeProviderClient:
@@ -14,6 +14,7 @@ class _FakeProviderClient:
         self.history_reads = 0
         self.last_message = None
         self.next_message_id = 1
+        self.delete_response = "Key deletada!\nEXTERNAL-AB12-CD34-EF56"
 
     async def is_user_authorized(self):
         return True
@@ -64,7 +65,7 @@ class _FakeProviderClient:
     async def send_message(self, chat, text):
         self.sent_messages.append(text)
         if text == "/start":
-            self.last_message = self._message("Main menu", ["Gerar Key Proxy"])
+            self.last_message = self._message("Main menu", ["Gerar Key Proxy", "Deletar Key"])
             await self._emit("new", self.last_message)
         elif text == "Gerar Key Proxy":
             # Simulate the provider editing its menu instead of sending a new message.
@@ -81,6 +82,12 @@ class _FakeProviderClient:
             await self._emit("new", self.last_message)
         elif text == "1":
             self.last_message = self._message("Key criada com sucesso\nEXTERNAL-AB12CD34")
+            await self._emit("new", self.last_message)
+        elif text == "Deletar Key":
+            self.last_message = self._message("Envie o codigo exato da key:\nFormato: EXTERNAL-XXXX-XXXX-XXXX")
+            await self._emit("new", self.last_message)
+        elif text == "EXTERNAL-AB12-CD34-EF56":
+            self.last_message = self._message(self.delete_response)
             await self._emit("new", self.last_message)
         else:
             raise AssertionError(f"unexpected provider message: {text}")
@@ -150,6 +157,34 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(fake_provider.history_reads, 0)
         self.assertEqual(fake_provider.handlers, [])
+
+    def test_delete_key_uses_provider_menu_and_waits_for_success(self):
+        client = ProxyVIPClient(api_id=123, api_hash="test-hash")
+        fake_provider = _FakeProviderClient()
+        client._client = fake_provider
+
+        result = asyncio.run(client.delete_key(key="external-ab12-cd34-ef56"))
+
+        self.assertIn("Key deletada", result)
+        self.assertEqual(
+            fake_provider.sent_messages,
+            ["/start", "Deletar Key", "EXTERNAL-AB12-CD34-EF56"],
+        )
+        self.assertEqual(fake_provider.handlers, [])
+
+    def test_delete_key_rejects_non_key_before_network_access(self):
+        client = ProxyVIPClient(api_id=0, api_hash="")
+        with self.assertRaisesRegex(ValueError, "key completa"):
+            asyncio.run(client.delete_key(key="not a key"))
+
+    def test_delete_key_fails_closed_when_provider_does_not_confirm(self):
+        client = ProxyVIPClient(api_id=123, api_hash="test-hash")
+        fake_provider = _FakeProviderClient()
+        fake_provider.delete_response = "Key não encontrada\nEXTERNAL-AB12-CD34-EF56"
+        client._client = fake_provider
+
+        with self.assertRaisesRegex(ProviderResponseError, "não confirmou"):
+            asyncio.run(client.delete_key(key="EXTERNAL-AB12-CD34-EF56"))
 
     def test_missing_telegram_credentials_fail_closed(self):
         client = ProxyVIPClient(api_id=0, api_hash="")

@@ -129,6 +129,13 @@ class ProxyVIPClient:
             return []
         return cls.KEY_PATTERN.findall(text)
 
+    @classmethod
+    def normalize_key(cls, key: str) -> str:
+        normalized = key.strip().upper()
+        if not cls.KEY_PATTERN.fullmatch(normalized):
+            raise ValueError("Informe uma key completa no formato EXTERNAL-XXXX-XXXX-XXXX.")
+        return normalized
+
     async def start(self) -> None:
         """Conecta sem iniciar login interativo; a autorização é feita por QR."""
         if not self.configured or self._client is not None:
@@ -248,6 +255,45 @@ class ProxyVIPClient:
                     after_id=duration_menu_id,
                     original_signature=original_signature,
                 )
+
+    async def delete_key(self, *, key: str) -> str:
+        """Delete one explicitly confirmed key through the provider's own menu."""
+        normalized = self.normalize_key(key)
+        if not self.configured:
+            raise ProviderIntegrationPending(
+                "Configure TELEGRAM_API_ID e TELEGRAM_API_HASH no Railway e use /conectar_proxy para autorizar."
+            )
+        if self._client is None:
+            await self.start()
+        if self._client is None or not await self._client.is_user_authorized():
+            raise ProviderNotAuthorized(
+                "A conta ainda não está autorizada. O administrador deve usar /conectar_proxy."
+            )
+
+        async with self._lock:
+            chat = await self._client.get_entity(self.PROVIDER_USERNAME)
+            bot_id = int(chat.id)
+            start_message = await self._send_and_wait(chat, bot_id, "/start")
+            delete_prompt = await self._choose_and_wait(
+                chat, bot_id, start_message, "Deletar Key"
+            )
+            prompt_text = str(getattr(delete_prompt, "message", "") or "").casefold()
+            if "key" not in prompt_text or not any(word in prompt_text for word in ("código", "codigo", "exact", "key:")):
+                raise ProviderResponseError(
+                    "O provedor não exibiu o pedido de confirmação/código para excluir a key."
+                )
+            result = await self._send_and_wait(chat, bot_id, normalized)
+            result_text = str(getattr(result, "message", "") or "")
+            normalized_result = result_text.casefold()
+            success_words = ("deletad", "deleted", "apag", "removid")
+            failure_words = ("não", "nao", "not found", "inexist", "inválid", "invalid", "falha", "error")
+            if (
+                normalized in result_text.upper()
+                and any(word in normalized_result for word in success_words)
+                and not any(word in normalized_result for word in failure_words)
+            ):
+                return result_text
+            raise ProviderResponseError("O provedor não confirmou a exclusão da key solicitada.")
 
     @asynccontextmanager
     async def _bot_message_feed(self, chat: Any, bot_id: int) -> AsyncIterator[asyncio.Queue[tuple[str, Any]]]:
