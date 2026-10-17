@@ -39,7 +39,13 @@ class AccessControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             approve(self.RESELLER, 0, self.ADMIN, now=100)
         with self.assertRaises(ValueError):
+            approve(self.RESELLER, 31, self.ADMIN, now=100)
+        with self.assertRaises(ValueError):
             approve(-1, 1, self.ADMIN, now=100)
+
+    def test_grant_accepts_one_through_thirty_days(self):
+        self.assertEqual(approve(self.RESELLER, 1, self.ADMIN, now=100), 100 + 86400)
+        self.assertEqual(approve(self.RESELLER, 30, self.ADMIN, now=100), 100 + 30 * 86400)
 
     def test_request_alert_cooldown(self):
         self.assertTrue(should_alert(self.RESELLER, cooldown_seconds=100, now=1000))

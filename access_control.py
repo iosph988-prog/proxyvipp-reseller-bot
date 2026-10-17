@@ -45,8 +45,8 @@ def is_allowed(user_id: int, admin_id: int, now: int | None = None) -> bool:
 def approve(user_id: int, days: int, admin_id: int, now: int | None = None) -> int:
     if user_id <= 0:
         raise ValueError("ID do Telegram inválido")
-    if not 1 <= days <= 3650:
-        raise ValueError("o prazo deve ficar entre 1 e 3650 dias")
+    if not 1 <= days <= 30:
+        raise ValueError("o prazo deve ficar entre 1 e 30 dias")
     now = int(time.time()) if now is None else int(now)
     expires_at = now + days * 86400
     with _connect() as conn:

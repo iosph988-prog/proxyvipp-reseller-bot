@@ -12,13 +12,13 @@ O vídeo mostra as durações de 1, 3, 7, 15 e 30 dias e um limite máximo de 10
 
 Revendedores sem acesso usam `/pedir_acesso`. O administrador configurado por `ADMIN_ID` pode usar:
 
-- `/aprovar ID DIAS` — libera um revendedor pelo prazo indicado.
+- `/add_revendedor ID DIAS` — libera um ID por **1 a 30 dias** (ex.: `/add_revendedor 123456789 7`). `/aprovar ID DIAS` continua como alias.
 - `/revogar ID` — remove o acesso imediatamente.
-- `/usuarios` — lista os acessos ativos.
+- `/revendedores` — lista os acessos ativos (`/usuarios` continua como alias).
 - `/status_proxy` — verifica a configuração e a autorização da conta Telegram.
 - `/conectar_proxy` — envia ao administrador um QR para autorizar a sessão da conta.
 
-Para solicitar keys, um usuário aprovado usa `/gerar DIAS QUANTIDADE`. A saída é enviada de volta no mesmo chat. O primeiro uso do bot deve começar por `/start`.
+Para solicitar keys, um usuário aprovado pode usar `/gerar DIAS QUANTIDADE` ou seguir o menu de botões de `/start` e `/ajuda`: escolhe a duração, a quantidade e recebe um cartão com as keys e opção de cópia. O painel administrativo inclui atalhos para cadastrar e listar revendedores.
 
 ## Acesso da conta Telegram
 
