@@ -1,51 +1,44 @@
 # Bot de revendedores Proxy VIP
 
-Projeto inicial separado do bot `.3105`. Usa `python-telegram-bot` e SQLite no volume persistente do Railway.
+Projeto separado do bot `.3105`. O bot aplica controle de acesso temporário por ID e, quando configurado, solicita keys ao `@proxyvipp_bot` usando uma sessão Telegram pessoal autorizada. O resultado é entregue no chat do bot de revendedores.
 
-## Estado atual
+## Como funciona
 
-- O controle de revendedores por ID e prazo está implementado.
-- Só o administrador configurado pode aprovar, revogar ou listar acessos.
-- O bot aceita pedidos de geração em formato provisório `/gerar DIAS QUANTIDADE`, com limite de lote 100 baseado no vídeo recebido.
-- **A emissão real está deliberadamente desativada** até a API oficial do Proxy VIP ser documentada e integrada. O vídeo mostra o fluxo manual no Telegram, não uma API. Este projeto não automatiza uma conta pessoal nem envia comandos para outro bot via chat.
-- As opções de duração e o contrato final de geração precisam ser alinhados com a documentação do fornecedor.
+A Bot API do Telegram não permite que um bot converse diretamente com outro bot. Por isso, este projeto usa Telethon como cliente da conta Telegram autorizada pelo administrador. A conta envia somente o fluxo de geração mostrado no vídeo: `/start` → **Gerar Key Proxy** → duração → quantidade. O bot não automatiza as funções de banir, apagar ou resetar keys.
 
-## Comandos
+O vídeo mostra as durações de 1, 3, 7, 15 e 30 dias e um limite máximo de 100 keys por pedido. A automação aceita esses prazos; horas e duração personalizada ainda não estão implementadas.
 
-Para revendedores aprovados:
+## Controle de acesso e comandos
 
-- `/start` — instruções
-- `/pedir_acesso` — solicita acesso ao administrador
-- `/gerar DIAS QUANTIDADE` — pedido de geração; permanece bloqueado até a API oficial estar ligada
+Revendedores sem acesso usam `/pedir_acesso`. O administrador configurado por `ADMIN_ID` pode usar:
 
-Para o administrador (`ADMIN_ID`):
+- `/aprovar ID DIAS` — libera um revendedor pelo prazo indicado.
+- `/revogar ID` — remove o acesso imediatamente.
+- `/usuarios` — lista os acessos ativos.
+- `/status_proxy` — verifica a configuração e a autorização da conta Telegram.
+- `/conectar_proxy` — envia ao administrador um QR para autorizar a sessão da conta.
 
-- `/aprovar ID DIAS` — concede acesso por prazo
-- `/revogar ID` — revoga imediatamente
-- `/usuarios` — lista autorizações ativas
+Para solicitar keys, um usuário aprovado usa `/gerar DIAS QUANTIDADE`. A saída é enviada de volta no mesmo chat. O primeiro uso do bot deve começar por `/start`.
 
-Configure o ID do administrador apenas como variável de ambiente privada no Railway. A autorização expira automaticamente. Reaprovar substitui o prazo anterior por um novo prazo contado a partir da aprovação.
+## Acesso da conta Telegram
 
-## Segredos e Railway
+A sessão Telethon permite ao serviço **ler e enviar mensagens como a conta pessoal** para executar o fluxo com `@proxyvipp_bot`. O QR de `/conectar_proxy` deve ser escaneado somente pelo administrador no app do Telegram: **Configurações → Dispositivos → Vincular dispositivo**. Não encaminhe o QR.
 
-Configure no Railway **Variables** (não neste repositório):
+O arquivo de sessão (`TELEGRAM_SESSION_PATH`) e o banco (`ACCESS_DB`) devem ficar em um volume persistente montado em `/data` no Railway. Para revogar a sessão, use Telegram → Configurações → Dispositivos e encerre a sessão do serviço. Nunca publique o arquivo `.session`, `api_hash`, token do BotFather, códigos de login ou keys geradas.
 
-- `KEY_BOT_TOKEN` — token do bot criado no BotFather
-- `ADMIN_ID` — ID numérico do administrador
-- `ACCESS_DB=/data/proxyvip_reseller_access.sqlite3` — banco persistente no volume montado em `/data`
+## Variáveis privadas do Railway
 
-Não publique ou envie `KEY_BOT_TOKEN`, tokens da API, keys geradas ou códigos de login em mensagens. Se um token já foi compartilhado, revogue-o no serviço emissor e gere outro.
+Configure em **Variables**; não coloque valores reais neste repositório:
 
-## API do provedor
+- `KEY_BOT_TOKEN` — token do bot criado no BotFather.
+- `ADMIN_ID` — ID numérico do administrador.
+- `TELEGRAM_API_ID` — ID do app Telegram Developers já existente na conta.
+- `TELEGRAM_API_HASH` — hash secreto do mesmo app; mantenha privado.
+- `ACCESS_DB=/data/proxyvip_reseller_access.sqlite3` — banco de autorizações.
+- `TELEGRAM_SESSION_PATH=/data/proxyvip_userbot` — base do arquivo de sessão persistente.
 
-Para habilitar geração, forneça documentação oficial com URL-base, autenticação (sem o valor do segredo), endpoint/método, parâmetros de duração/quantidade, resposta de sucesso/erro, e operações autorizadas. O adaptador `provider.py` só deve ser implementado a partir dessa especificação. Depois, os segredos de API serão adicionados como variáveis protegidas no Railway.
+O volume `/data` precisa estar montado antes do uso para que aprovações e sessão sobrevivam aos reinícios. Verifique a cobrança do volume no Railway antes de criá-lo.
 
-## Executar localmente
+## Estado/limites
 
-```bash
-python -m pip install -r requirements.txt
-export KEY_BOT_TOKEN='(configurar fora do código)'
-export ADMIN_ID='<seu ID numérico>'
-export ACCESS_DB=/tmp/proxyvip-access.sqlite3
-python main.py
-```
+O código não armazena segredos no GitHub. A emissão depende das variáveis privadas, de um volume persistente e da autorização QR pelo administrador. As mensagens de keys não são gravadas em logs. O bot de revendedores não modifica o projeto `.3105`.

@@ -3,5 +3,7 @@
 !.env.example
 *.sqlite3
 *.db
+*.session
+*.session-journal
 __pycache__/
 *.py[cod]

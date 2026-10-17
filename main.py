@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
+from io import BytesIO
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from access_control import approve, is_allowed, list_active, revoke, should_alert
-from provider import ProviderIntegrationPending, ProxyVIPClient
+from provider import (
+    ProviderAuthorizationError,
+    ProviderIntegrationPending,
+    ProviderNotAuthorized,
+    ProxyVIPClient,
+)
 
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 BOT_TOKEN = os.getenv("KEY_BOT_TOKEN", "")
-MAX_KEY_BATCH = 100  # limite mostrado no vídeo de referência
+MAX_KEY_BATCH = 100
 provider = ProxyVIPClient()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -62,7 +69,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(
         "Bot de geração de keys Proxy VIP\n\n"
         "Use /gerar DIAS QUANTIDADE para pedir keys.\n"
-        "A emissão real será ativada após integrar a API oficial."
+        "Durações disponíveis: 1, 3, 7, 15 ou 30 dias; máximo de 100 keys por pedido."
     )
 
 
@@ -128,6 +135,79 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await message.reply_text("\n".join(lines))
 
 
+async def _finish_proxy_qr_login(bot, login_task) -> None:
+    try:
+        authorized = await login_task
+        if authorized:
+            await bot.send_message(
+                ADMIN_ID,
+                "Conta Telegram conectada. O serviço poderá enviar comandos a @proxyvipp_bot "
+                "e receber as respostas para entregar as keys neste bot.",
+            )
+        else:
+            await bot.send_message(ADMIN_ID, "Não consegui confirmar a autorização Telegram. Tente /conectar_proxy de novo.")
+    except ProviderAuthorizationError as exc:
+        await bot.send_message(ADMIN_ID, str(exc))
+    except Exception:
+        logger.exception("Falha ao concluir autorização da conta Telegram")
+        await bot.send_message(ADMIN_ID, "A autorização falhou. Confira os logs do serviço e tente novamente.")
+
+
+async def connect_proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or user.id != ADMIN_ID:
+        return
+    try:
+        if await provider.is_authorized():
+            await message.reply_text("A conta Telegram já está conectada.")
+            return
+        qr_image = await provider.begin_qr_login()
+    except (ProviderIntegrationPending, ProviderAuthorizationError) as exc:
+        await message.reply_text(str(exc))
+        return
+    except Exception:
+        logger.exception("Falha ao iniciar autorização QR")
+        await message.reply_text("Não consegui iniciar a autorização agora. Confira as variáveis privadas no Railway.")
+        return
+
+    # Telethon exige que QRLogin.wait esteja ativo antes que o QR seja escaneado.
+    login_task = context.application.create_task(provider.wait_for_qr_login())
+    await asyncio.sleep(0)
+    try:
+        await message.reply_photo(
+            photo=BytesIO(qr_image),
+            caption=(
+                "Escaneie este QR no app do Telegram em Configurações → Dispositivos → Vincular dispositivo.\n"
+                "Ele autoriza uma sessão persistente do serviço para ler e enviar mensagens como sua conta. "
+                "Não encaminhe o QR. Se expirar, use /conectar_proxy novamente."
+            ),
+        )
+    except Exception:
+        login_task.cancel()
+        raise
+    context.application.create_task(_finish_proxy_qr_login(context.bot, login_task))
+
+
+async def proxy_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or user.id != ADMIN_ID:
+        return
+    try:
+        authorized = await provider.is_authorized()
+    except Exception:
+        logger.exception("Falha ao consultar status da sessão Proxy VIP")
+        await message.reply_text("Não consegui consultar a sessão. Confira as variáveis privadas e o volume /data.")
+        return
+    if not provider.configured:
+        await message.reply_text("Integração incompleta: faltam TELEGRAM_API_ID e TELEGRAM_API_HASH no Railway.")
+    elif authorized:
+        await message.reply_text("A sessão do Telegram está conectada.")
+    else:
+        await message.reply_text("A sessão ainda não foi autorizada. Use /conectar_proxy.")
+
+
 async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -137,41 +217,67 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _access_denied(update, context)
         return
     if len(context.args) != 2 or not all(arg.isdigit() for arg in context.args):
-        await message.reply_text("Uso provisório: /gerar DIAS QUANTIDADE\nQuantidade máxima por pedido: 100.")
+        await message.reply_text(
+            "Uso: /gerar DIAS QUANTIDADE\nDurações: 1, 3, 7, 15 ou 30 dias.\nQuantidade máxima: 100."
+        )
         return
     duration_days, quantity = map(int, context.args)
-    if not 1 <= duration_days <= 3650:
-        await message.reply_text("A duração deve ficar entre 1 e 3650 dias.")
+    if duration_days not in provider.DURATION_LABELS:
+        await message.reply_text("Duração disponível: 1, 3, 7, 15 ou 30 dias.")
         return
     if not 1 <= quantity <= MAX_KEY_BATCH:
         await message.reply_text(f"A quantidade deve ficar entre 1 e {MAX_KEY_BATCH}.")
         return
     try:
         keys = await provider.generate_keys(duration_days=duration_days, quantity=quantity)
-    except ProviderIntegrationPending:
-        await message.reply_text(
-            "A emissão automática ainda não está configurada. Ela será ativada após conectar a API oficial do Proxy VIP."
-        )
+    except (ProviderIntegrationPending, ProviderNotAuthorized) as exc:
+        await message.reply_text(str(exc))
+        return
+    except ValueError as exc:
+        await message.reply_text(str(exc))
         return
     except Exception:
-        logger.exception("Falha na API oficial de geração")
+        logger.exception("Falha ao solicitar keys ao bot fornecedor")
         await message.reply_text("Não consegui gerar as keys agora. Tente novamente mais tarde.")
         return
     if not keys:
-        await message.reply_text("A API não retornou keys.")
+        await message.reply_text("O bot fornecedor não retornou keys.")
         return
-    await message.reply_text("Keys geradas:\n" + "\n".join(str(key) for key in keys))
+    await message.reply_text("Keys geradas:\n" + "\n".join(keys))
+
+
+async def _post_init(application: Application) -> None:
+    try:
+        await provider.start()
+    except Exception:
+        # O bot de acesso continua disponível, mas geração e login QR ficam indisponíveis.
+        logger.exception("Cliente Telegram pessoal não iniciou; verifique as variáveis e o volume /data")
+
+
+async def _post_shutdown(application: Application) -> None:
+    try:
+        await provider.stop()
+    except Exception:
+        logger.exception("Falha ao encerrar cliente Telegram pessoal")
 
 
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("Configure KEY_BOT_TOKEN como variável secreta antes de iniciar o bot.")
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("pedir_acesso", request_access))
     app.add_handler(CommandHandler("aprovar", approve_command))
     app.add_handler(CommandHandler("revogar", revoke_command))
     app.add_handler(CommandHandler("usuarios", users_command))
+    app.add_handler(CommandHandler("conectar_proxy", connect_proxy_command))
+    app.add_handler(CommandHandler("status_proxy", proxy_status_command))
     app.add_handler(CommandHandler("gerar", generate_command))
     return app
 
