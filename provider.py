@@ -59,6 +59,7 @@ class ProxyVIPClient:
         self._client: Any | None = None
         self._pending_qr: Any | None = None
         self._lock = asyncio.Lock()
+        self._qr_lock = asyncio.Lock()
 
     @property
     def configured(self) -> bool:
@@ -71,6 +72,37 @@ class ProxyVIPClient:
         except KeyError as exc:
             choices = ", ".join(str(day) for day in cls.DURATION_LABELS)
             raise ValueError(f"Duração indisponível. Escolha um destes prazos em dias: {choices}.") from exc
+
+    @staticmethod
+    def _find_button(message: Any, label: str) -> tuple[int, int, str] | None:
+        markup = getattr(message, "reply_markup", None)
+        rows = getattr(markup, "rows", []) or []
+        target = " ".join(label.casefold().split())
+        for row_index, row in enumerate(rows):
+            for column_index, button in enumerate(getattr(row, "buttons", []) or []):
+                button_text = str(getattr(button, "text", "") or "")
+                normalized = " ".join(button_text.casefold().split())
+                if target and target in normalized:
+                    return row_index, column_index, button_text
+        return None
+
+    @staticmethod
+    def _is_quantity_prompt(message: Any) -> bool:
+        text = str(getattr(message, "message", "") or "").casefold()
+        return ("quantidade" in text and "key" in text) or ("quantity" in text and "key" in text)
+
+    async def _choose_duration_or_default(self, chat: Any, bot_id: int, message: Any, duration_days: int) -> Any:
+        label = self.duration_label(duration_days)
+        if self._find_button(message, label):
+            return await self._choose_and_wait(chat, bot_id, message, label)
+        if self._is_quantity_prompt(message):
+            if duration_days != 1:
+                raise ValueError(
+                    "O fornecedor está oferecendo a duração padrão de 1 dia sem seletor. "
+                    "Nenhuma key foi solicitada; escolha 1 dia ou aguarde um seletor de duração."
+                )
+            return message
+        return await self._choose_and_wait(chat, bot_id, message, label)
 
     @classmethod
     def extract_keys(cls, text: str | None) -> list[str]:
@@ -121,21 +153,26 @@ class ProxyVIPClient:
         if await self._client.is_user_authorized():
             raise ProviderAuthorizationError("A sessão do Telegram já está autorizada.")
 
-        try:
-            import qrcode
+        import qrcode
 
-            self._pending_qr = await self._client.qr_login()
-            image = qrcode.make(self._pending_qr.url)
-            output = io.BytesIO()
-            image.save(output, format="PNG")
-            return output.getvalue()
-        except Exception:
-            self._pending_qr = None
-            raise
+        async with self._qr_lock:
+            if self._pending_qr is not None:
+                raise ProviderAuthorizationError("Já existe um pedido de autorização em andamento.")
+            try:
+                self._pending_qr = await self._client.qr_login()
+                image = qrcode.make(self._pending_qr.url)
+                output = io.BytesIO()
+                image.save(output, format="PNG")
+                return output.getvalue()
+            except Exception:
+                self._pending_qr = None
+                raise
 
     async def wait_for_qr_login(self, timeout_seconds: int = 120) -> bool:
-        qr, self._pending_qr = self._pending_qr, None
-        if qr is None or self._client is None:
+        async with self._qr_lock:
+            qr = self._pending_qr
+            client = self._client
+        if qr is None or client is None:
             raise ProviderAuthorizationError("Não há uma autorização QR pendente.")
         try:
             from telethon.errors import SessionPasswordNeededError
@@ -151,14 +188,18 @@ class ProxyVIPClient:
             ) from exc
         except Exception as exc:
             raise ProviderAuthorizationError("A autorização Telegram não foi concluída.") from exc
-        return bool(await self._client.is_user_authorized())
+        finally:
+            async with self._qr_lock:
+                if self._pending_qr is qr:
+                    self._pending_qr = None
+        return bool(await client.is_user_authorized())
 
     async def generate_keys(self, *, duration_days: int, quantity: int) -> list[str]:
         if duration_days < 1 or quantity < 1:
             raise ValueError("Duração e quantidade devem ser positivas.")
         if quantity > self.MAX_KEYS:
             raise ValueError(f"A quantidade máxima por pedido é {self.MAX_KEYS}.")
-        duration_label = self.duration_label(duration_days)
+        self.duration_label(duration_days)
         if not self.configured:
             raise ProviderIntegrationPending(
                 "Configure TELEGRAM_API_ID e TELEGRAM_API_HASH no Railway e use /conectar_proxy para autorizar."
@@ -175,7 +216,7 @@ class ProxyVIPClient:
             bot_id = int(chat.id)
             start_message = await self._send_and_wait(chat, bot_id, "/start")
             generation_menu = await self._choose_and_wait(chat, bot_id, start_message, "Gerar Key Proxy")
-            duration_menu = await self._choose_and_wait(chat, bot_id, generation_menu, duration_label)
+            duration_menu = await self._choose_duration_or_default(chat, bot_id, generation_menu, duration_days)
             before_quantity_id = int(duration_menu.id)
             await self._client.send_message(chat, str(quantity))
             return await self._wait_for_keys(chat, bot_id, before_quantity_id, quantity)
@@ -207,8 +248,13 @@ class ProxyVIPClient:
 
         after_id = int(message.id)
         markup = getattr(message, "reply_markup", None)
+        button = self._find_button(message, label)
         if isinstance(markup, ReplyInlineMarkup):
-            await message.click(text=label)
+            if button is None:
+                raise ProviderResponseError(f"Não encontrei o botão esperado no fornecedor: {label}.")
+            await message.click(button[0], button[1])
+        elif button is not None:
+            await self._client.send_message(chat, button[2])
         else:
             await self._client.send_message(chat, label)
         return await self._wait_for_bot_message(chat, bot_id, after_id)

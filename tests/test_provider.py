@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 
 from provider import ProviderIntegrationPending, ProxyVIPClient
 
@@ -14,6 +15,33 @@ class ProviderTests(unittest.TestCase):
     def test_rejects_duration_not_shown_by_provider(self):
         with self.assertRaisesRegex(ValueError, "Duração indisponível"):
             ProxyVIPClient.duration_label(2)
+
+    def test_button_matching_ignores_leading_emoji(self):
+        button_text = "🔑 Gerar Key Proxy"
+        message = SimpleNamespace(
+            reply_markup=SimpleNamespace(
+                rows=[SimpleNamespace(buttons=[SimpleNamespace(text=button_text)])]
+            )
+        )
+        self.assertEqual(
+            ProxyVIPClient._find_button(message, "Gerar Key Proxy"),
+            (0, 0, button_text),
+        )
+
+    def test_default_one_day_quantity_prompt_is_supported_but_other_durations_fail_closed(self):
+        client = ProxyVIPClient()
+        prompt = SimpleNamespace(
+            message="📄 Gerar Keys\n⏱ Duracao: 1 Dia\nEnvie a quantidade de keys para gerar (Max: 100):",
+            reply_markup=None,
+        )
+        selected = asyncio.run(client._choose_duration_or_default(None, 0, prompt, 1))
+        self.assertIs(selected, prompt)
+        with self.assertRaisesRegex(ValueError, "duração padrão de 1 dia"):
+            asyncio.run(client._choose_duration_or_default(None, 0, prompt, 3))
+
+    def test_quantity_prompt_detection(self):
+        prompt = SimpleNamespace(message="Envie a quantidade de keys para gerar (Max: 100):")
+        self.assertTrue(ProxyVIPClient._is_quantity_prompt(prompt))
 
     def test_extracts_only_external_keys(self):
         text = (
