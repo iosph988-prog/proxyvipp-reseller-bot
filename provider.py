@@ -42,7 +42,11 @@ class ProxyVIPClient:
         15: "15 Dias",
         30: "30 Dias",
     }
-    KEY_PATTERN = re.compile(r"\bEXTERNAL-[A-Za-z0-9_-]{4,}\b")
+    # Preserve the legacy format and accept the provider's current TROPADOD keys.
+    KEY_PATTERN = re.compile(
+        r"\b(?:EXTERNAL-[A-Za-z0-9_-]{4,}|TROPADOD(?:-[A-Za-z0-9]{4}){3})\b",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -134,7 +138,9 @@ class ProxyVIPClient:
     def normalize_key(cls, key: str) -> str:
         normalized = key.strip().upper()
         if not cls.KEY_PATTERN.fullmatch(normalized):
-            raise ValueError("Informe uma key completa no formato EXTERNAL-XXXX-XXXX-XXXX.")
+            raise ValueError(
+                "Informe uma key completa no formato EXTERNAL-... ou TROPADOD-XXXX-XXXX-XXXX."
+            )
         return normalized
 
     async def start(self) -> None:
@@ -427,7 +433,7 @@ class ProxyVIPClient:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise ProviderResponseError(
-                    "O fornecedor não confirmou a quantidade solicitada de keys EXTERNAL-."
+                    "O fornecedor não confirmou a quantidade solicitada de keys."
                 )
 
             try:

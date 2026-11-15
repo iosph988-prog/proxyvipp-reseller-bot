@@ -14,6 +14,7 @@ class _FakeProviderClient:
         self.history_reads = 0
         self.last_message = None
         self.next_message_id = 1
+        self.generated_response = "Key criada com sucesso\nEXTERNAL-AB12CD34"
         self.delete_response = "Key deletada!\nEXTERNAL-AB12-CD34-EF56"
 
     async def is_user_authorized(self):
@@ -74,19 +75,20 @@ class _FakeProviderClient:
                 rows=[SimpleNamespace(buttons=[
                     SimpleNamespace(text="1 Dia"),
                     SimpleNamespace(text="3 Dias"),
+                    SimpleNamespace(text="7 Dias"),
                 ])]
             )
             await self._emit("edited", self.last_message)
-        elif text == "1 Dia":
+        elif text in {"1 Dia", "3 Dias", "7 Dias"}:
             self.last_message = self._message("Envie a quantidade de keys para gerar:")
             await self._emit("new", self.last_message)
         elif text == "1":
-            self.last_message = self._message("Key criada com sucesso\nEXTERNAL-AB12CD34")
+            self.last_message = self._message(self.generated_response)
             await self._emit("new", self.last_message)
         elif text == "Deletar Key":
             self.last_message = self._message("Envie o codigo exato da key:\nFormato: EXTERNAL-XXXX-XXXX-XXXX")
             await self._emit("new", self.last_message)
-        elif text == "EXTERNAL-AB12-CD34-EF56":
+        elif text.startswith(("EXTERNAL-", "TROPADOD-")):
             self.last_message = self._message(self.delete_response)
             await self._emit("new", self.last_message)
         else:
@@ -143,6 +145,19 @@ class ProviderTests(unittest.TestCase):
             ["EXTERNAL-AB12CD34", "EXTERNAL-EF56GH78"],
         )
 
+    def test_extracts_current_provider_key_format(self):
+        text = "Key criada com sucesso\nTROPADOD-ABCD-EF12-GH34\nDuração: 7 Dias"
+        self.assertEqual(
+            ProxyVIPClient.extract_keys(text),
+            ["TROPADOD-ABCD-EF12-GH34"],
+        )
+
+    def test_normalize_accepts_current_provider_key_format(self):
+        self.assertEqual(
+            ProxyVIPClient.normalize_key("tropadod-abcd-ef12-gh34"),
+            "TROPADOD-ABCD-EF12-GH34",
+        )
+
     def test_generation_uses_events_and_handles_edited_provider_menu(self):
         client = ProxyVIPClient(api_id=123, api_hash="test-hash")
         fake_provider = _FakeProviderClient()
@@ -157,6 +172,20 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(fake_provider.history_reads, 0)
         self.assertEqual(fake_provider.handlers, [])
+
+    def test_generation_returns_current_provider_key_format_for_seven_days(self):
+        client = ProxyVIPClient(api_id=123, api_hash="test-hash")
+        fake_provider = _FakeProviderClient()
+        fake_provider.generated_response = "Key criada com sucesso\nTROPADOD-ABCD-EF12-GH34"
+        client._client = fake_provider
+
+        keys = asyncio.run(client.generate_keys(duration_days=7, quantity=1))
+
+        self.assertEqual(keys, ["TROPADOD-ABCD-EF12-GH34"])
+        self.assertEqual(
+            fake_provider.sent_messages,
+            ["/start", "Gerar Key Proxy", "7 Dias", "1"],
+        )
 
     def test_wait_for_keys_recovers_from_history_when_event_is_missed(self):
         client = ProxyVIPClient(api_id=123, api_hash="test-hash")
@@ -194,6 +223,20 @@ class ProviderTests(unittest.TestCase):
             ["/start", "Deletar Key", "EXTERNAL-AB12-CD34-EF56"],
         )
         self.assertEqual(fake_provider.handlers, [])
+
+    def test_delete_key_accepts_current_provider_key_format(self):
+        client = ProxyVIPClient(api_id=123, api_hash="test-hash")
+        fake_provider = _FakeProviderClient()
+        fake_provider.delete_response = "Key deletada!\nTROPADOD-ABCD-EF12-GH34"
+        client._client = fake_provider
+
+        result = asyncio.run(client.delete_key(key="tropadod-abcd-ef12-gh34"))
+
+        self.assertIn("TROPADOD-ABCD-EF12-GH34", result)
+        self.assertEqual(
+            fake_provider.sent_messages,
+            ["/start", "Deletar Key", "TROPADOD-ABCD-EF12-GH34"],
+        )
 
     def test_delete_key_rejects_non_key_before_network_access(self):
         client = ProxyVIPClient(api_id=0, api_hash="")
