@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import io
 import os
 import re
@@ -251,6 +252,8 @@ class ProxyVIPClient:
                 await self._client.send_message(chat, str(quantity))
                 return await self._wait_for_keys(
                     incoming,
+                    chat=chat,
+                    bot_id=bot_id,
                     quantity=quantity,
                     after_id=duration_menu_id,
                     original_signature=original_signature,
@@ -303,12 +306,11 @@ class ProxyVIPClient:
         incoming: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
         async def on_new_message(event: Any) -> None:
-            if int(getattr(event, "sender_id", 0) or 0) == bot_id:
-                incoming.put_nowait(("new", event.message))
+            # The event builder is already scoped to this provider chat.
+            incoming.put_nowait(("new", event.message))
 
         async def on_edited_message(event: Any) -> None:
-            if int(getattr(event, "sender_id", 0) or 0) == bot_id:
-                incoming.put_nowait(("edited", event.message))
+            incoming.put_nowait(("edited", event.message))
 
         handlers = (
             (on_new_message, events.NewMessage(chats=chat)),
@@ -391,37 +393,70 @@ class ProxyVIPClient:
         self,
         incoming: asyncio.Queue[tuple[str, Any]],
         *,
+        chat: Any,
+        bot_id: int,
         after_id: int,
         quantity: int,
         timeout: float = 60.0,
+        history_poll_interval: float = 4.0,
         original_signature: tuple[str, tuple[tuple[str, ...], ...]] | None = None,
     ) -> list[str]:
         deadline = asyncio.get_running_loop().time() + timeout
         keys: list[str] = []
         seen_events: set[tuple[int, tuple[str, tuple[tuple[str, ...], ...]]]] = set()
+
+        def collect(message: Any, event_type: str) -> bool:
+            message_id = int(getattr(message, "id", 0) or 0)
+            signature = self._message_signature(message)
+            if event_type == "new" and message_id <= after_id:
+                return False
+            if event_type == "edited":
+                if message_id < after_id:
+                    return False
+                if message_id == after_id and signature == original_signature:
+                    return False
+            event_key = (message_id, signature)
+            if event_key in seen_events:
+                return False
+            seen_events.add(event_key)
+            keys.extend(self.extract_keys(getattr(message, "message", "")))
+            return len(dict.fromkeys(keys)) >= quantity
+
+        interval = max(0.1, history_poll_interval)
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise ProviderResponseError("A resposta não continha a quantidade esperada de keys EXTERNAL-.")
-            try:
-                event_type, message = await asyncio.wait_for(incoming.get(), timeout=remaining)
-            except asyncio.TimeoutError as exc:
-                raise ProviderResponseError("A resposta não continha a quantidade esperada de keys EXTERNAL-.") from exc
+                raise ProviderResponseError(
+                    "O fornecedor não confirmou a quantidade solicitada de keys EXTERNAL-."
+                )
 
-            message_id = int(message.id)
-            signature = self._message_signature(message)
-            if event_type == "new" and message_id <= after_id:
-                continue
-            if event_type == "edited":
-                if message_id < after_id:
+            try:
+                event_type, message = await asyncio.wait_for(
+                    incoming.get(), timeout=min(remaining, interval)
+                )
+            except asyncio.TimeoutError:
+                # Telegram updates are primary; a light history fallback recovers
+                # replies/edits that Telethon may have missed during reconnects.
+                try:
+                    messages = await self._client.get_messages(chat, limit=100)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "Fallback de histórico do provedor falhou (%s).",
+                        type(exc).__name__,
+                    )
                     continue
-                if message_id == after_id and signature == original_signature:
-                    continue
-            event_key = (message_id, signature)
-            if event_key in seen_events:
+
+                for history_message in sorted(
+                    messages or [], key=lambda item: int(getattr(item, "id", 0) or 0)
+                ):
+                    sender_id = getattr(history_message, "sender_id", None)
+                    if sender_id is not None and int(sender_id) != bot_id:
+                        continue
+                    history_id = int(getattr(history_message, "id", 0) or 0)
+                    history_type = "edited" if history_id == after_id else "new"
+                    if collect(history_message, history_type):
+                        return list(dict.fromkeys(keys))[:quantity]
                 continue
-            seen_events.add(event_key)
-            keys.extend(self.extract_keys(getattr(message, "message", "")))
-            unique = list(dict.fromkeys(keys))
-            if len(unique) >= quantity:
-                return unique[:quantity]
+
+            if collect(message, event_type):
+                return list(dict.fromkeys(keys))[:quantity]

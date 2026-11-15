@@ -158,6 +158,29 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(fake_provider.history_reads, 0)
         self.assertEqual(fake_provider.handlers, [])
 
+    def test_wait_for_keys_recovers_from_history_when_event_is_missed(self):
+        client = ProxyVIPClient(api_id=123, api_hash="test-hash")
+        fake_provider = _FakeProviderClient()
+        fake_provider.last_message = fake_provider._message(
+            "Key criada com sucesso\nEXTERNAL-AB12CD34", message_id=2
+        )
+        client._client = fake_provider
+
+        keys = asyncio.run(
+            client._wait_for_keys(
+                asyncio.Queue(),
+                chat=SimpleNamespace(id=fake_provider.bot_id),
+                bot_id=fake_provider.bot_id,
+                after_id=1,
+                quantity=1,
+                timeout=1.0,
+                history_poll_interval=0.01,
+            )
+        )
+
+        self.assertEqual(keys, ["EXTERNAL-AB12CD34"])
+        self.assertGreater(fake_provider.history_reads, 0)
+
     def test_delete_key_uses_provider_menu_and_waits_for_success(self):
         client = ProxyVIPClient(api_id=123, api_hash="test-hash")
         fake_provider = _FakeProviderClient()

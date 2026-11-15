@@ -40,6 +40,7 @@ from provider import (
     ProviderAuthorizationError,
     ProviderIntegrationPending,
     ProviderNotAuthorized,
+    ProviderResponseError,
     ProxyVIPClient,
 )
 
@@ -354,6 +355,12 @@ async def _generate_and_reply(message, duration_days: int, quantity: int, user_i
     except ValueError as exc:
         await message.reply_text(f"⚠️ {escape(str(exc))}", parse_mode=ParseMode.HTML)
         return
+    except ProviderResponseError:
+        logger.warning("O provedor não confirmou a geração solicitada.")
+        await message.reply_text(
+            "⚠️ O provedor não confirmou a emissão. Confira a conversa com o provedor antes de tentar novamente, para evitar uma key duplicada."
+        )
+        return
     except Exception:
         logger.exception("Falha ao solicitar keys ao bot fornecedor")
         await message.reply_text("❌ Não consegui gerar as keys agora. Tente novamente mais tarde.")
@@ -434,7 +441,10 @@ async def quantity_input_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
     duration_days = context.user_data.pop("pending_generation_days")
     await message.reply_text("⏳ Pedido recebido. Preparando suas keys...")
-    await _generate_and_reply(message, duration_days, quantity, user.id)
+    context.application.create_task(
+        _generate_and_reply(message, duration_days, quantity, user.id),
+        update=update,
+    )
 
 
 async def delete_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -608,7 +618,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "<b>⏳ PEDIDO EM ANDAMENTO</b>\n\nConsultando o provedor...",
             parse_mode=ParseMode.HTML,
         )
-        await _generate_and_reply(message, duration_days, quantity, user.id)
+        context.application.create_task(
+            _generate_and_reply(message, duration_days, quantity, user.id),
+            update=update,
+        )
     elif data == "add_reseller_help":
         await message.reply_text(
             "<b>➕ ADICIONAR REVENDEDOR</b>\n\n"
@@ -744,7 +757,10 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text(f"A quantidade deve ficar entre 1 e {MAX_KEY_BATCH}.")
         return
     await message.reply_text("⏳ Pedido recebido. Preparando suas keys...")
-    await _generate_and_reply(message, duration_days, quantity, user.id)
+    context.application.create_task(
+        _generate_and_reply(message, duration_days, quantity, user.id),
+        update=update,
+    )
 
 
 async def _post_init(application: Application) -> None:
